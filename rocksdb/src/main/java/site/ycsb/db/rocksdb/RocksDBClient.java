@@ -17,12 +17,15 @@
 
 package site.ycsb.db.rocksdb;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import site.ycsb.*;
 import site.ycsb.Status;
 import net.jcip.annotations.GuardedBy;
 import org.rocksdb.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import site.ycsb.measurements.Measurements;
 
 import java.io.*;
 import java.nio.ByteBuffer;
@@ -45,6 +48,7 @@ public class RocksDBClient extends DB {
   static final String PROPERTY_ROCKSDB_DIR = "rocksdb.dir";
   static final String PROPERTY_ROCKSDB_OPTIONS_FILE = "rocksdb.optionsfile";
   private static final String COLUMN_FAMILY_NAMES_FILENAME = "CF_NAMES";
+  private static final String CDC_LOG_FILE_NAME = "/tmp/cdc_log";
 
   private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBClient.class);
 
@@ -53,6 +57,8 @@ public class RocksDBClient extends DB {
   @GuardedBy("RocksDBClient.class") private static RocksObject dbOptions = null;
   @GuardedBy("RocksDBClient.class") private static RocksDB rocksDb = null;
   @GuardedBy("RocksDBClient.class") private static int references = 0;
+  @GuardedBy("RocksDBClient.class") private static FileOutputStream outputStream;
+  @GuardedBy("RocksDBClient.class") private static ObjectMapper objectMapper;
 
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
@@ -81,6 +87,19 @@ public class RocksDBClient extends DB {
         }
       }
 
+      try {
+        if (outputStream == null) {
+          outputStream = new FileOutputStream(CDC_LOG_FILE_NAME);
+        }
+      } catch (final  IOException e) {
+        throw new DBException(e);
+      }
+
+      // set object mapper
+      objectMapper = new ObjectMapper();
+      // disable auto close
+      objectMapper.getFactory().disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
+
       references++;
     }
   }
@@ -101,8 +120,12 @@ public class RocksDBClient extends DB {
     final List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
     final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
 
-    RocksDB.loadLibrary();
-    OptionsUtil.loadOptionsFromFile(optionsFile.toAbsolutePath().toString(), Env.getDefault(), options, cfDescriptors);
+    final ConfigOptions configOptions =
+        new ConfigOptions().setEnv(Env.getDefault());
+    OptionsUtil.loadOptionsFromFile(
+        configOptions, optionsFile.toAbsolutePath().toString(), options, cfDescriptors);
+    // OptionsUtil.loadOptionsFromFile(
+    // optionsFile.toAbsolutePath().toString(), Env.getDefault(), options, cfDescriptors);
     dbOptions = options;
 
     final RocksDB db = RocksDB.open(options, rocksDbDir.toAbsolutePath().toString(), cfDescriptors, cfHandles);
@@ -111,7 +134,6 @@ public class RocksDBClient extends DB {
       String cfName = new String(cfDescriptors.get(i).getName());
       final ColumnFamilyHandle cfHandle = cfHandles.get(i);
       final ColumnFamilyOptions cfOptions = cfDescriptors.get(i).getOptions();
-
       COLUMN_FAMILIES.put(cfName, new ColumnFamily(cfHandle, cfOptions));
     }
 
@@ -192,6 +214,9 @@ public class RocksDBClient extends DB {
           dbOptions.close();
           dbOptions = null;
 
+          outputStream.close();
+          outputStream = null;
+
           for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
             cf.getOptions().close();
           }
@@ -241,8 +266,9 @@ public class RocksDBClient extends DB {
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
       try(final RocksIterator iterator = rocksDb.newIterator(cf)) {
         int iterations = 0;
-        for (iterator.seek(startkey.getBytes(UTF_8)); iterator.isValid() && iterations < recordcount;
-             iterator.next()) {
+        iterator.seek(startkey.getBytes(UTF_8));
+        while (iterator.isValid() && iterations < recordcount) {
+          iterator.next();
           final HashMap<String, ByteIterator> values = new HashMap<>();
           deserializeValues(iterator.value(), fields, values);
           result.add(values);
@@ -268,7 +294,14 @@ public class RocksDBClient extends DB {
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
       final Map<String, ByteIterator> result = new HashMap<>();
+
+      // read update_before
+      long startTs = System.nanoTime();
       final byte[] currentValues = rocksDb.get(cf, key.getBytes(UTF_8));
+      long endTs = System.nanoTime();
+      Measurements.getMeasurements().measure("read_while_updating",
+          (int) ((endTs - startTs) / 1000));
+
       if(currentValues == null) {
         return Status.NOT_FOUND;
       }
@@ -276,9 +309,17 @@ public class RocksDBClient extends DB {
 
       //update
       result.putAll(values);
+      byte[] updateAfterValues = serializeValues(result);
+
+      startTs = System.nanoTime();
+      // now write update_before and update_after
+      writeUpdateToCDCLog(currentValues, updateAfterValues);
+      endTs = System.nanoTime();
+      Measurements.getMeasurements().measure("write_update_to_cdc",
+          (int) ((endTs - startTs) / 1000));
 
       //store
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(result));
+      rocksDb.put(cf, key.getBytes(UTF_8), updateAfterValues);
 
       return Status.OK;
 
@@ -305,6 +346,26 @@ public class RocksDBClient extends DB {
     }
   }
 
+  public Status readByTimeStamp(final String table, final String key) {
+    try {
+      ReadOptions readOptions  = new ReadOptions();
+      readOptions.setTimestamp(buildRandomSlice());
+      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      byte[] bytes =  rocksDb.get(cf, readOptions, key.getBytes(UTF_8));
+      return Status.OK;
+    }  catch (final RocksDBException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    }
+  }
+
+  private Slice buildRandomSlice() {
+    final Random rand = new Random();
+    final byte[] sliceBytes = new byte[8];
+    rand.nextBytes(sliceBytes);
+    return new Slice(sliceBytes);
+  }
+
   @Override
   public Status delete(final String table, final String key) {
     try {
@@ -320,6 +381,14 @@ public class RocksDBClient extends DB {
       LOGGER.error(e.getMessage(), e);
       return Status.ERROR;
     }
+  }
+
+  private void writeUpdateToCDCLog(byte[] updateBeforeValues, byte[] updateAfterValues) throws IOException{
+    Map<String, Object> map = new HashMap<>();
+    map.put("before", updateBeforeValues);
+    map.put("after", updateAfterValues);
+    objectMapper.writeValue(outputStream, map);
+    outputStream.getFD().sync();
   }
 
   private void saveColumnFamilyNames() throws IOException {
@@ -436,7 +505,6 @@ public class RocksDBClient extends DB {
         } else {
           cfOptions = new ColumnFamilyOptions().optimizeLevelStyleCompaction();
         }
-
         final ColumnFamilyHandle cfHandle = rocksDb.createColumnFamily(
             new ColumnFamilyDescriptor(name.getBytes(UTF_8), cfOptions)
         );

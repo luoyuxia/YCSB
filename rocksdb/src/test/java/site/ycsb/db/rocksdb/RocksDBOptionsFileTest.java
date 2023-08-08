@@ -20,6 +20,7 @@ package site.ycsb.db.rocksdb;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
 import org.rocksdb.*;
+import site.ycsb.measurements.Measurements;
 
 import java.util.*;
 
@@ -34,6 +35,7 @@ public class RocksDBOptionsFileTest {
 
   @Test
   public void loadOptionsFromFile() throws Exception {
+    Measurements.setProperties(new Properties());
     final String optionsPath = RocksDBClient.class.getClassLoader().getResource("testcase.ini").getPath();
     final String dbPath = tmpFolder.getRoot().getAbsolutePath();
 
@@ -58,7 +60,9 @@ public class RocksDBOptionsFileTest {
     final DBOptions dbOptions = new DBOptions();
 
     RocksDB.loadLibrary();
-    OptionsUtil.loadLatestOptions(dbPath, Env.getDefault(), dbOptions, cfDescriptors);
+    ConfigOptions configOptions = new ConfigOptions()
+        .setEnv(Env.getDefault());
+    OptionsUtil.loadLatestOptions(configOptions, dbPath, dbOptions, cfDescriptors);
 
     try {
       assertEquals(dbOptions.walSizeLimitMB(), 42);

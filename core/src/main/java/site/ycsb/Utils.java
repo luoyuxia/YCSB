@@ -158,6 +158,13 @@ public final class Utils {
     return osBean.getSystemLoadAverage();
   }
 
+  /** @return The current system cpu load. */
+  public static double getSystemCPULoad() {
+    final com.sun.management.OperatingSystemMXBean
+        operatingSystemMXBean = (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+    return operatingSystemMXBean.getSystemCpuLoad();
+  }
+
   /** @return The total number of garbage collections executed for all
    * memory pools. */
   public static long getGCTotalCollectionCount() {

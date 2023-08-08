@@ -52,6 +52,9 @@ public class Measurements {
   private static Measurements singleton = null;
   private static Properties measurementproperties = null;
 
+  // ms
+  private static Long opsFinishTime;
+
   public static void setProperties(Properties props) {
     measurementproperties = props;
   }
@@ -64,6 +67,10 @@ public class Measurements {
       singleton = new Measurements(measurementproperties);
     }
     return singleton;
+  }
+
+  public Long getOpsFinishTime() {
+    return opsFinishTime;
   }
 
   private final ConcurrentHashMap<String, OneMeasurement> opToMesurementMap;
@@ -192,6 +199,12 @@ public class Measurements {
       System.out.println("ERROR: java.lang.ArrayIndexOutOfBoundsException - ignoring and continuing");
       e.printStackTrace();
       e.printStackTrace(System.out);
+    }
+  }
+
+  public synchronized void setOpsFinishTime(long finishTime) {
+    if (opsFinishTime == null || finishTime > opsFinishTime) {
+      opsFinishTime = finishTime;
     }
   }
 

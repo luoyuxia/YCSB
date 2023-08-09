@@ -150,7 +150,7 @@ public class ClientThread implements Runnable {
     try {
       measurements.setIntendedStartTimeNs(0);
       db.cleanup();
-    } catch (DBException e) {
+    } catch (Exception e) {
       e.printStackTrace();
       e.printStackTrace(System.out);
     } finally {

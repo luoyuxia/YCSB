@@ -249,6 +249,8 @@ public class StatusThread extends Thread {
       }
     }
 
+    measurements.measure("SYS_CPU_LOAD", (int) (Utils.getSystemCPULoad() * 100));
+
     final long gcs = Utils.getGCTotalCollectionCount();
     measurements.measure("GCS", (int) (gcs - lastGCCount));
     final long gcTime = Utils.getGCTotalTime();

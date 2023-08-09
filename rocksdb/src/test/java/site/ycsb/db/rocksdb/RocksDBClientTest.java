@@ -82,17 +82,6 @@ public class RocksDBClientTest {
   }
 
 
-  public void insertAndRead1() throws Exception {
-    final Status insertResult = instance.insert(MOCK_TABLE, MOCK_KEY0, MOCK_DATA);
-    assertEquals(Status.OK, insertResult);
-
-    final Set<String> fields = MOCK_DATA.keySet();
-    final Map<String, ByteIterator> resultParam = new HashMap<>(NUM_RECORDS);
-    final Status readResult = instance.readByTimeStamp(MOCK_TABLE, MOCK_KEY0);
-    assertEquals(Status.OK, readResult);
-  }
-
-
   public void myTest() throws Exception {
     List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
     final Options options = new Options()

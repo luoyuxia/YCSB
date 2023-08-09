@@ -25,6 +25,7 @@
 recordcount=1000000
 operationcount=1000000
 workload=site.ycsb.workloads.CoreWorkload
+measurement.trackjvm=true
 
 readallfields=true
 writeallfields=true

@@ -29,10 +29,12 @@ import site.ycsb.measurements.Measurements;
 
 import java.io.*;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -48,20 +50,29 @@ public class RocksDBClient extends DB {
   static final String PROPERTY_ROCKSDB_DIR = "rocksdb.dir";
   static final String PROPERTY_ROCKSDB_OPTIONS_FILE = "rocksdb.optionsfile";
   private static final String COLUMN_FAMILY_NAMES_FILENAME = "CF_NAMES";
-  private static final String CDC_LOG_FILE_NAME = "/tmp/cdc_log";
+
+  private static final String WAL_LOG = "/tmp/wal_log";
+  private static final String CDC_LOG = "/tmp/cdc_log";
 
   private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBClient.class);
 
   @GuardedBy("RocksDBClient.class") private static Path rocksDbDir = null;
   @GuardedBy("RocksDBClient.class") private static Path optionsFile = null;
   @GuardedBy("RocksDBClient.class") private static RocksObject dbOptions = null;
+  @GuardedBy("RocksDBClient.class") private static WriteOptions writeOptions = null;
   @GuardedBy("RocksDBClient.class") private static RocksDB rocksDb = null;
   @GuardedBy("RocksDBClient.class") private static int references = 0;
   @GuardedBy("RocksDBClient.class") private static FileOutputStream outputStream;
   @GuardedBy("RocksDBClient.class") private static ObjectMapper objectMapper;
+  @GuardedBy("RocksDBClient.class") private static Options enableTimestampOptions = new Options()
+      .setComparator(BuiltinComparator.BYTEWISE_COMPARATOR_WITHU64Ts);
+  @GuardedBy("RocksDBClient.class") private static final AtomicBoolean LOG_AGENT_FINISH = new AtomicBoolean(false);
 
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
+
+  private final ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder());
+  private static  LogAgent logAgent;
 
   @Override
   public void init() throws DBException {
@@ -82,25 +93,16 @@ public class RocksDBClient extends DB {
           } else {
             rocksDb = initRocksDB();
           }
+          outputStream = new FileOutputStream(WAL_LOG);
         } catch (final IOException | RocksDBException e) {
           throw new DBException(e);
         }
+        writeOptions = new WriteOptions().setDisableWAL(true);
+        objectMapper = new ObjectMapper();
+        objectMapper.getFactory().disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
+        logAgent = new LogAgent(WAL_LOG, CDC_LOG, rocksDb, COLUMN_FAMILIES, LOG_AGENT_FINISH);
+        references++;
       }
-
-      try {
-        if (outputStream == null) {
-          outputStream = new FileOutputStream(CDC_LOG_FILE_NAME);
-        }
-      } catch (final  IOException e) {
-        throw new DBException(e);
-      }
-
-      // set object mapper
-      objectMapper = new ObjectMapper();
-      // disable auto close
-      objectMapper.getFactory().disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
-
-      references++;
     }
   }
 
@@ -157,7 +159,7 @@ public class RocksDBClient extends DB {
     final List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
 
     for(final String cfName : cfNames) {
-      final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
+      final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions(enableTimestampOptions)
           .optimizeLevelStyleCompaction();
       final ColumnFamilyDescriptor cfDescriptor = new ColumnFamilyDescriptor(
           cfName.getBytes(UTF_8),
@@ -176,7 +178,8 @@ public class RocksDBClient extends DB {
           .setCreateMissingColumnFamilies(true)
           .setIncreaseParallelism(rocksThreads)
           .setMaxBackgroundCompactions(rocksThreads)
-          .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
+          .setInfoLogLevel(InfoLogLevel.INFO_LEVEL)
+          .setComparator(BuiltinComparator.BYTEWISE_COMPARATOR_WITHU64Ts);
       dbOptions = options;
       return RocksDB.open(options, rocksDbDir.toAbsolutePath().toString());
     } else {
@@ -200,19 +203,26 @@ public class RocksDBClient extends DB {
   @Override
   public void cleanup() throws DBException {
     super.cleanup();
-
     synchronized (RocksDBClient.class) {
       try {
         if (references == 1) {
+          // it means the ops finish, but we may still need to wait the log agent finish
+          Measurements.getMeasurements().setOpsFinishTime(System.currentTimeMillis());
+          waitLogAgent();
           for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
             cf.getHandle().close();
           }
-
           rocksDb.close();
           rocksDb = null;
 
           dbOptions.close();
           dbOptions = null;
+
+          writeOptions.close();
+          writeOptions = null;
+
+          enableTimestampOptions.close();
+          enableTimestampOptions = null;
 
           outputStream.close();
           outputStream = null;
@@ -224,14 +234,32 @@ public class RocksDBClient extends DB {
           COLUMN_FAMILIES.clear();
 
           rocksDbDir = null;
+          if (logAgent != null) {
+            logAgent.close();
+          }
         }
-
-      } catch (final IOException e) {
+      } catch (final Exception e) {
         throw new DBException(e);
       } finally {
         references--;
       }
     }
+  }
+
+  private void waitLogAgent() throws Exception {
+    // write eof to WAL
+    writeEOFToWAL();
+    // while loop to see the log agent has modify this value
+    while (true) {
+      if (LOG_AGENT_FINISH.get()) {
+        return;
+      }
+      Thread.sleep(100L);
+    }
+  }
+
+  private void writeEOFToWAL() throws Exception {
+    outputStream.write(System.lineSeparator().getBytes());
   }
 
   @Override
@@ -243,7 +271,12 @@ public class RocksDBClient extends DB {
       }
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      final byte[] values = rocksDb.get(cf, key.getBytes(UTF_8));
+      byte[] values;
+      byte[] timestamp = generateTimestamp();
+      try(ReadOptions readOptions = new ReadOptions()) {
+        readOptions.setTimestamp(new Slice(timestamp));
+        values = rocksDb.get(cf, readOptions, key.getBytes(UTF_8));
+      }
       if(values == null) {
         return Status.NOT_FOUND;
       }
@@ -295,32 +328,21 @@ public class RocksDBClient extends DB {
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
       final Map<String, ByteIterator> result = new HashMap<>();
 
-      // read update_before
-      long startTs = System.nanoTime();
-      final byte[] currentValues = rocksDb.get(cf, key.getBytes(UTF_8));
-      long endTs = System.nanoTime();
-      Measurements.getMeasurements().measure("read_while_updating",
-          (int) ((endTs - startTs) / 1000));
-
-      if(currentValues == null) {
-        return Status.NOT_FOUND;
-      }
-      deserializeValues(currentValues, null, result);
-
       //update
       result.putAll(values);
       byte[] updateAfterValues = serializeValues(result);
+      byte[] keyBytes =  key.getBytes(UTF_8);
 
-      startTs = System.nanoTime();
+      long startTs = System.nanoTime();
       // now write update_before and update_after
-      writeUpdateToCDCLog(currentValues, updateAfterValues);
-      endTs = System.nanoTime();
-      Measurements.getMeasurements().measure("write_update_to_cdc",
+      byte[] timestamp = generateTimestamp();
+      writeToWAL(generateTimestamp(), keyBytes, updateAfterValues);
+      long endTs = System.nanoTime();
+      Measurements.getMeasurements().measure("write_to_wal",
           (int) ((endTs - startTs) / 1000));
 
       //store
-      rocksDb.put(cf, key.getBytes(UTF_8), updateAfterValues);
-
+      rocksDb.put(cf, keyBytes, timestamp, updateAfterValues);
       return Status.OK;
 
     } catch(final RocksDBException | IOException e) {
@@ -337,7 +359,7 @@ public class RocksDBClient extends DB {
       }
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(values));
+      rocksDb.put(cf, key.getBytes(UTF_8), generateTimestamp(), serializeValues(values));
 
       return Status.OK;
     } catch(final RocksDBException | IOException e) {
@@ -346,24 +368,11 @@ public class RocksDBClient extends DB {
     }
   }
 
-  public Status readByTimeStamp(final String table, final String key) {
-    try {
-      ReadOptions readOptions  = new ReadOptions();
-      readOptions.setTimestamp(buildRandomSlice());
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      byte[] bytes =  rocksDb.get(cf, readOptions, key.getBytes(UTF_8));
-      return Status.OK;
-    }  catch (final RocksDBException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-    }
-  }
-
-  private Slice buildRandomSlice() {
-    final Random rand = new Random();
-    final byte[] sliceBytes = new byte[8];
-    rand.nextBytes(sliceBytes);
-    return new Slice(sliceBytes);
+  private byte[] generateTimestamp() {
+    long value = System.currentTimeMillis();
+    buffer.clear();
+    buffer.putLong(value);
+    return buffer.array();
   }
 
   @Override
@@ -383,8 +392,23 @@ public class RocksDBClient extends DB {
     }
   }
 
-  private void writeUpdateToCDCLog(byte[] updateBeforeValues, byte[] updateAfterValues) throws IOException{
+  private void writeToWAL(byte[] timestamp,
+                          byte[] key, byte[] updateAfterValues) throws IOException {
     Map<String, Object> map = new HashMap<>();
+    map.put("timestamp", timestamp);
+    map.put("key", key);
+    map.put("updateAfter", updateAfterValues);
+    objectMapper.writeValue(outputStream, map);
+    outputStream.write(System.lineSeparator().getBytes());
+    // only flush to keep it similar to rocksdb default strategy
+    outputStream.flush();
+//    outputStream.getFD().sync();
+  }
+
+  private void writeUpdateToCDCLog(byte[] timestamp, byte[] updateBeforeValues,
+                                   byte[] updateAfterValues) throws IOException{
+    Map<String, Object> map = new HashMap<>();
+    map.put("timestamp", timestamp);
     map.put("before", updateBeforeValues);
     map.put("after", updateAfterValues);
     objectMapper.writeValue(outputStream, map);
@@ -503,7 +527,7 @@ public class RocksDBClient extends DB {
           // apply those options to this column family
           cfOptions = getDefaultColumnFamilyOptions(name);
         } else {
-          cfOptions = new ColumnFamilyOptions().optimizeLevelStyleCompaction();
+          cfOptions = new ColumnFamilyOptions(enableTimestampOptions).optimizeLevelStyleCompaction();
         }
         final ColumnFamilyHandle cfHandle = rocksDb.createColumnFamily(
             new ColumnFamilyDescriptor(name.getBytes(UTF_8), cfOptions)
@@ -515,7 +539,8 @@ public class RocksDBClient extends DB {
     }
   }
 
-  private static final class ColumnFamily {
+  /** Column Family.*/
+  public static final class ColumnFamily {
     private final ColumnFamilyHandle handle;
     private final ColumnFamilyOptions options;
 

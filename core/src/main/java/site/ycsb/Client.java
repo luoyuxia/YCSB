@@ -211,7 +211,7 @@ public final class Client {
    *
    * @throws IOException Either failed to write to output stream or failed to close it.
    */
-  private static void exportMeasurements(Properties props, int opcount, long runtime)
+  private static void exportMeasurements(Properties props, int opcount, long startTime, long runtime)
       throws IOException {
     MeasurementsExporter exporter = null;
     try {
@@ -238,7 +238,12 @@ public final class Client {
       }
 
       exporter.write("OVERALL", "RunTime(ms)", runtime);
-      double throughput = 1000.0 * (opcount) / (runtime);
+      long opsRunningTime = runtime;
+      if (Measurements.getMeasurements().getOpsFinishTime() != null) {
+        opsRunningTime = Measurements.getMeasurements().getOpsFinishTime() - startTime;
+      }
+      exporter.write("OVERALL", "OperationRunTime(ms)", opsRunningTime);
+      double throughput = 1000.0 * (opcount) / (opsRunningTime);
       exporter.write("OVERALL", "Throughput(ops/sec)", throughput);
 
       final Map<String, Long[]> gcs = Utils.getGCStatst();
@@ -389,7 +394,7 @@ public final class Client {
 
     try {
       try (final TraceScope span = tracer.newScope(CLIENT_EXPORT_MEASUREMENTS_SPAN)) {
-        exportMeasurements(props, opsDone, en - st);
+        exportMeasurements(props, opsDone, st, en - st);
       }
     } catch (IOException e) {
       System.err.println("Could not export measurements, error: " + e.getMessage());

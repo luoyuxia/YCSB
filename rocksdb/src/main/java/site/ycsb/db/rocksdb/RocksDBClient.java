@@ -67,12 +67,16 @@ public class RocksDBClient extends DB {
   @GuardedBy("RocksDBClient.class") private static Options enableTimestampOptions = new Options()
       .setComparator(BuiltinComparator.BYTEWISE_COMPARATOR_WITHU64Ts);
   @GuardedBy("RocksDBClient.class") private static final AtomicBoolean LOG_AGENT_FINISH = new AtomicBoolean(false);
+  @GuardedBy("RocksDBClient.class") private static Statistics statistic;
 
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
 
   private final ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder());
   private static  LogAgent logAgent;
+  private final int maxCountPerSecond = 1_000_000;
+  private  int currentCountInSameSecond = 0;
+  private long currentUseTimestamp = -1;
 
   @Override
   public void init() throws DBException {
@@ -100,7 +104,8 @@ public class RocksDBClient extends DB {
         writeOptions = new WriteOptions().setDisableWAL(true);
         objectMapper = new ObjectMapper();
         objectMapper.getFactory().disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
-        logAgent = new LogAgent(WAL_LOG, CDC_LOG, rocksDb, COLUMN_FAMILIES, LOG_AGENT_FINISH);
+        logAgent = new LogAgent(WAL_LOG, CDC_LOG, rocksDb,
+            COLUMN_FAMILIES, LOG_AGENT_FINISH);
         references++;
       }
     }
@@ -178,8 +183,10 @@ public class RocksDBClient extends DB {
           .setCreateMissingColumnFamilies(true)
           .setIncreaseParallelism(rocksThreads)
           .setMaxBackgroundCompactions(rocksThreads)
-          .setInfoLogLevel(InfoLogLevel.INFO_LEVEL)
+          .setInfoLogLevel(InfoLogLevel.DEBUG_LEVEL)
           .setComparator(BuiltinComparator.BYTEWISE_COMPARATOR_WITHU64Ts);
+      statistic = new Statistics();
+      options.setStatistics(statistic);
       dbOptions = options;
       return RocksDB.open(options, rocksDbDir.toAbsolutePath().toString());
     } else {
@@ -188,7 +195,9 @@ public class RocksDBClient extends DB {
           .setCreateMissingColumnFamilies(true)
           .setIncreaseParallelism(rocksThreads)
           .setMaxBackgroundCompactions(rocksThreads)
-          .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
+          .setInfoLogLevel(InfoLogLevel.DEBUG_LEVEL);
+      statistic = new Statistics();
+      options.setStatistics(statistic);
       dbOptions = options;
 
       final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
@@ -212,8 +221,6 @@ public class RocksDBClient extends DB {
           for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
             cf.getHandle().close();
           }
-          rocksDb.close();
-          rocksDb = null;
 
           dbOptions.close();
           dbOptions = null;
@@ -237,6 +244,10 @@ public class RocksDBClient extends DB {
           if (logAgent != null) {
             logAgent.close();
           }
+
+          rocksDb.close();
+          rocksDb = null;
+          statistic.close();
         }
       } catch (final Exception e) {
         throw new DBException(e);
@@ -270,7 +281,8 @@ public class RocksDBClient extends DB {
         createColumnFamily(table);
       }
 
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      cf = rocksDb.getDefaultColumnFamily();
       byte[] values;
       byte[] timestamp = generateTimestamp();
       try(ReadOptions readOptions = new ReadOptions()) {
@@ -282,7 +294,7 @@ public class RocksDBClient extends DB {
       }
       deserializeValues(values, fields, result);
       return Status.OK;
-    } catch(final RocksDBException e) {
+    } catch(Exception e) {
       LOGGER.error(e.getMessage(), e);
       return Status.ERROR;
     }
@@ -325,24 +337,28 @@ public class RocksDBClient extends DB {
         createColumnFamily(table);
       }
 
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
       final Map<String, ByteIterator> result = new HashMap<>();
+      cf = rocksDb.getDefaultColumnFamily();
 
       //update
       result.putAll(values);
       byte[] updateAfterValues = serializeValues(result);
       byte[] keyBytes =  key.getBytes(UTF_8);
 
+      byte[] timestamp = generateTimestamp();
+
+      //store
+      rocksDb.put(cf, keyBytes, timestamp, updateAfterValues);
+//      rocksDb.flushWal(true);
+//      rocksDb.flush(new FlushOptions().setWaitForFlush(true));
+
       long startTs = System.nanoTime();
       // now write update_before and update_after
-      byte[] timestamp = generateTimestamp();
       writeToWAL(generateTimestamp(), keyBytes, updateAfterValues);
       long endTs = System.nanoTime();
       Measurements.getMeasurements().measure("write_to_wal",
           (int) ((endTs - startTs) / 1000));
-
-      //store
-      rocksDb.put(cf, keyBytes, timestamp, updateAfterValues);
       return Status.OK;
 
     } catch(final RocksDBException | IOException e) {
@@ -358,7 +374,8 @@ public class RocksDBClient extends DB {
         createColumnFamily(table);
       }
 
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      cf = rocksDb.getDefaultColumnFamily();
       rocksDb.put(cf, key.getBytes(UTF_8), generateTimestamp(), serializeValues(values));
 
       return Status.OK;
@@ -370,6 +387,15 @@ public class RocksDBClient extends DB {
 
   private byte[] generateTimestamp() {
     long value = System.currentTimeMillis();
+    if (value == currentUseTimestamp) {
+      // it means we have meet conflict
+      currentCountInSameSecond++;
+    } else {
+      // new timestamp
+      currentUseTimestamp = value;
+      currentCountInSameSecond = 0;
+    }
+    value = value * maxCountPerSecond + currentCountInSameSecond;
     buffer.clear();
     buffer.putLong(value);
     return buffer.array();

@@ -5,16 +5,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.io.input.Tailer;
 import org.apache.commons.io.input.TailerListenerAdapter;
-import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.ReadOptions;
-import org.rocksdb.RocksDB;
-import org.rocksdb.Slice;
+import org.rocksdb.*;
 import site.ycsb.measurements.Measurements;
 import site.ycsb.workloads.CoreWorkload;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.HashMap;
@@ -24,15 +19,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Agent for WAL LOG to produce cdc log.*/
 public class LogAgent {
-  private static final int SLEEP = 100;
+  private static final int SLEEP = 10;
   private final WALLogListener walLogListener;
   private final Tailer tailer;
+  private final RocksDB rocksDB;
 
   public LogAgent(String walLog, String cdcLog, RocksDB rocksDB,
                   ConcurrentMap<String, RocksDBClient.ColumnFamily> columnFamilies,
                   AtomicBoolean logAgentIsFinish) {
     walLogListener = new WALLogListener(cdcLog, rocksDB, columnFamilies, logAgentIsFinish);
     tailer = Tailer.create(new File(walLog), walLogListener, SLEEP);
+    this.rocksDB = rocksDB;
   }
 
   public void close() throws Exception {
@@ -41,6 +38,10 @@ public class LogAgent {
     }
     if (walLogListener != null) {
       walLogListener.close();
+    }
+
+    try(FileWriter fileWriter = new FileWriter("/tmp/statis")) {
+      fileWriter.write(rocksDB.getProperty("rocksdb.stats"));
     }
   }
 
@@ -52,7 +53,7 @@ public class LogAgent {
     private  ColumnFamilyHandle targetColumnFamilyHandle;
     private RocksDBClient.ColumnFamily columnFamily;
     private final ConcurrentMap<String, RocksDBClient.ColumnFamily> columnFamilies;
-    private final ByteBuffer buffer = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN);
+    private final ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
     private final AtomicBoolean logAgentIsFinish;
     private WALLogListener(String cdcLog, RocksDB rocksDB,
                            ConcurrentMap<String, RocksDBClient.ColumnFamily> columnFamilies,
@@ -82,14 +83,16 @@ public class LogAgent {
       try{
         JsonNode jsonNode =  objectMapper.readTree(line);
         byte[] timestamp = jsonNode.get("timestamp").binaryValue();
+        long timestampL = getTimeStamp(timestamp);
         byte[] key = jsonNode.get("key").binaryValue();
         byte[] updateAfter = jsonNode.get("updateAfter").binaryValue();
         // try to get update before
-        readOptions.setTimestamp(new Slice(timestamp));
+        readOptions.setTimestamp(new Slice(toTimestamp(timestampL - 1)));
         long startTs = System.nanoTime();
 //        if (!targetColumnFamilyHandle.isOwningHandle()) {
 //          return;
 //        }
+        targetColumnFamilyHandle = rocksDB.getDefaultColumnFamily();
         final byte[] updateBefore = rocksDB.get(targetColumnFamilyHandle, readOptions, key);
         long endTs = System.nanoTime();
         Measurements.getMeasurements().measure("reading_for_updating",
@@ -99,7 +102,7 @@ public class LogAgent {
         endTs = System.nanoTime();
         Measurements.getMeasurements().measure("writing_to_cdc",
             (int) ((endTs - startTs) / 1000));
-        long writeTimestamp = getTimeStamp(timestamp);
+        long writeTimestamp = timestampL / 1_000_000;
         Measurements.getMeasurements().measure("cdc_generate",
             (int) ((System.currentTimeMillis() - writeTimestamp) * 1000));
       } catch (Exception e) {
@@ -113,7 +116,7 @@ public class LogAgent {
       map.put("updateAfter", updateAfterValues);
       objectMapper.writeValue(cdcOutputStream, map);
       // flush instead of sync
-      cdcOutputStream.flush();
+//      cdcOutputStream.flush();
      // cdcOutputStream.getFD().sync();
     }
 
@@ -128,6 +131,12 @@ public class LogAgent {
       buffer.put(bytes);
       buffer.flip();
       return buffer.getLong();
+    }
+
+    private byte[] toTimestamp(long value) {
+      buffer.clear();
+      buffer.putLong(value);
+      return buffer.array();
     }
   }
 }

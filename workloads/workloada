@@ -30,8 +30,8 @@ measurement.trackjvm=true
 readallfields=true
 writeallfields=true
 
-readproportion=0.5
-updateproportion=0.5
+readproportion=0
+updateproportion=1
 scanproportion=0
 insertproportion=0
 

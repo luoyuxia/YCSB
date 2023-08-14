@@ -162,6 +162,7 @@ public class RocksDBClient extends DB {
 
     for(final String cfName : cfNames) {
       final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
+          .setInplaceUpdateSupport(true)
           .optimizeLevelStyleCompaction();
       final ColumnFamilyDescriptor cfDescriptor = new ColumnFamilyDescriptor(
           cfName.getBytes(UTF_8),
@@ -180,6 +181,8 @@ public class RocksDBClient extends DB {
           .setCreateMissingColumnFamilies(true)
           .setIncreaseParallelism(rocksThreads)
           .setMaxBackgroundCompactions(rocksThreads)
+          .setInplaceUpdateSupport(true)
+          .setAllowConcurrentMemtableWrite(false)
           .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
       statistic = new Statistics();
       options.setStatistics(statistic);
@@ -191,6 +194,7 @@ public class RocksDBClient extends DB {
           .setCreateMissingColumnFamilies(true)
           .setIncreaseParallelism(rocksThreads)
           .setMaxBackgroundCompactions(rocksThreads)
+          .setAllowConcurrentMemtableWrite(false)
           .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
       statistic = new Statistics();
       options.setStatistics(statistic);
@@ -522,7 +526,8 @@ public class RocksDBClient extends DB {
           // apply those options to this column family
           cfOptions = getDefaultColumnFamilyOptions(name);
         } else {
-          cfOptions = new ColumnFamilyOptions().optimizeLevelStyleCompaction();
+          cfOptions = new ColumnFamilyOptions().optimizeLevelStyleCompaction()
+              .setInplaceUpdateSupport(true);
         }
         final ColumnFamilyHandle cfHandle = rocksDb.createColumnFamily(
             new ColumnFamilyDescriptor(name.getBytes(UTF_8), cfOptions)

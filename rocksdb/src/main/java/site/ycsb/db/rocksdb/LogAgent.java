@@ -13,7 +13,7 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.*;
 
 /** Agent for WAL LOG to produce cdc log.*/
 public class LogAgent {
@@ -55,22 +55,28 @@ public class LogAgent {
   private static final class WALLogListener extends TailerListenerAdapter {
 
     private static final int MAX_BATCH_SIZE = 512;
+    private static final int MAX_FLUSH_THREAD = 3;
+
     private static final int MAX_ALLOW_LATENCY_MILLS = 1_000;
     private final FileOutputStream cdcOutputStream;
     private final ObjectMapper objectMapper;
     private final RocksDB rocksDB;
-    private final ReadOptions readOptions = new ReadOptions();
+    private final List<ReadOptions> readOptions = new ArrayList<>();
     private  ColumnFamilyHandle targetColumnFamilyHandle;
     private RocksDBClient.ColumnFamily columnFamily;
     private final ConcurrentMap<String, RocksDBClient.ColumnFamily> columnFamilies;
     private final ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
     private  boolean logAgentIsFinish;
 
-    private final List<byte[]> bufferKeys = new ArrayList<>();
-    private final List<byte[]> bufferUpdateAfter = new ArrayList<>();
-    private final Set<ByteBuffer> inBufferKeySet = new HashSet<>();
-    private final List<Long> updateTimestamp= new ArrayList<>();
-    private long searchTimeStamp = 0;
+    private final List<List<byte[]>> bufferKeys = new ArrayList<>();
+    private final List<List<byte[]>> bufferUpdateBefore = new ArrayList<>();
+    private final List<List<byte[]>> bufferUpdateAfter = new ArrayList<>();
+    private final List<Set<ByteBuffer>> inBufferKeySets = new ArrayList<>();
+    private final List<List<Long>> updateTimestamp= new ArrayList<>();
+    private List<Long> searchTimeStamps = new ArrayList<>();
+    private ExecutorService executor;
+    private long searchTimeStamp;
+    private int currentBatch = 1;
 
 
     private boolean cdcIsLate;
@@ -82,6 +88,12 @@ public class LogAgent {
         objectMapper.getFactory().disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
         this.columnFamilies = columnFamilies;
         this.rocksDB = rocksDB;
+        for (int i = 0; i < MAX_FLUSH_THREAD; i++) {
+          readOptions.add(new ReadOptions());
+          bufferUpdateBefore.add(new ArrayList<>());
+          searchTimeStamps.add(1L);
+        }
+        executor = Executors.newFixedThreadPool(MAX_FLUSH_THREAD);
       } catch (Exception e) {
         throw new RuntimeException("Fail to create WAL log listener.", e);
       }
@@ -105,6 +117,12 @@ public class LogAgent {
 //        targetColumnFamilyHandle = rocksDB.getDefaultColumnFamily();
       }
       try{
+        while (bufferKeys.size() < currentBatch) {
+          bufferKeys.add(new ArrayList<>());
+          inBufferKeySets.add(new HashSet<>());
+          updateTimestamp.add(new ArrayList<>());
+          bufferUpdateAfter.add(new ArrayList<>());
+        }
         JsonNode jsonNode =  objectMapper.readTree(line);
         // get the timestamp while writing
         byte[] timestamp = jsonNode.get("timestamp").binaryValue();
@@ -117,58 +135,116 @@ public class LogAgent {
         ByteBuffer keyByteBuffer = ByteBuffer.wrap(key);
 
         // we have to flush if we seen the key again, otherwise we will get wrong result
-        boolean forceFlush = inBufferKeySet.contains(keyByteBuffer);
-        if (forceFlush) {
-          mayFlush(true);
+        boolean containKeys = inBufferKeySets.get(currentBatch - 1).contains(keyByteBuffer);
+        if (containKeys) {
+          // now, we create a new batch
+          currentBatch++;
+          if (currentBatch > MAX_FLUSH_THREAD) {
+            mayFlush(true);
+            currentBatch = 1;
+          }
+        }
+
+        while (bufferKeys.size() < currentBatch) {
+          bufferKeys.add(new ArrayList<>());
+          inBufferKeySets.add(new HashSet<>());
+          updateTimestamp.add(new ArrayList<>());
+          bufferUpdateAfter.add(new ArrayList<>());
         }
 
         // add the key to buffer keys
-        inBufferKeySet.add(keyByteBuffer);
-        bufferKeys.add(key);
+        inBufferKeySets.get(currentBatch - 1).add(keyByteBuffer);
+        bufferKeys.get(currentBatch - 1).add(key);
         // add update after
-        bufferUpdateAfter.add(updateAfter);
-        updateTimestamp.add(timestampLong / 1_000_000);
+        bufferUpdateAfter.get(currentBatch - 1).add(updateAfter);
+        updateTimestamp.get(currentBatch - 1).add(timestampLong / 1_000_000);
         searchTimeStamp = timestampLong - 1;
+        searchTimeStamps.set(currentBatch - 1, searchTimeStamp);
         mayFlush(false);
       } catch (Exception e) {
+        e.printStackTrace();
         throw new RuntimeException("Fail to handle the line.", e);
       }
     }
 
     private void mayFlush(boolean force) throws Exception {
+      int bufferKeySize = getBufferKeySize();
       // if force flush, but nothing to flush, return directly
-      if (force && bufferKeys.size() == 0) {
+      if (force && bufferKeySize == 0) {
         return;
       }
       // if not force flush, and nothing to flush or the buffer size < max batch size
-      if (!force && (bufferKeys.size() == 0 || bufferKeys.size() < MAX_BATCH_SIZE)) {
+      if (!force && (bufferKeySize < MAX_BATCH_SIZE)) {
         return;
       }
+
       long startTs = System.nanoTime();
-      readOptions.setTimestamp(new Slice(toTimestamp(searchTimeStamp)));
-      List<byte[]> updateBefore = rocksDB.multiGetAsList(readOptions, bufferKeys);
+      List<Future<List<byte[]>>> futures = new ArrayList<>();
+
+      for (int i = 0; i < bufferKeys.size(); i++) {
+        futures.add(executor.submit(new FetchTask(readOptions.get(i),
+            bufferKeys.get(i), toTimestamp(searchTimeStamps.get(i)))));
+      }
+
+      for (int i = 0; i < futures.size(); i++) {
+        bufferUpdateBefore.set(i, futures.get(i).get());
+      }
+
       long endTs = System.nanoTime();
       Measurements.getMeasurements().measure("batch_get_as_list",
-          (int) ((endTs - startTs) / (1000 * bufferKeys.size())));
-      Measurements.getMeasurements().measure("batch_get_size",
-          bufferKeys.size());
+          (int) ((endTs - startTs) / (1000 * bufferKeySize)));
+      Measurements.getMeasurements().measure("batch_get_size", bufferKeySize);
 
-      for (int i = 0; i < updateBefore.size(); i++) {
-        startTs = System.nanoTime();
-        writeUpdateToCDCLog(bufferKeys.get(i),
-            updateBefore.get(i), bufferUpdateAfter.get(i));
-        endTs = System.nanoTime();
-        Measurements.getMeasurements().measure("write_cdc_log",
-            (int) ((endTs - startTs) / 1000));
-
-        long latency = System.currentTimeMillis() - updateTimestamp.get(i);
-        Measurements.getMeasurements().measure("cdc_generate", (int) (latency * 1000));
-        cdcIsLate = latency > MAX_ALLOW_LATENCY_MILLS;
+      for (int i = 0; i < bufferKeys.size(); i++) {
+        List<byte[]> bufferKey = bufferKeys.get(i);
+        for (int k = 0; k < bufferKey.size(); k++) {
+          startTs = System.nanoTime();
+          writeUpdateToCDCLog(bufferKey.get(k),
+              bufferUpdateBefore.get(i).get(k),
+              bufferUpdateAfter.get(i).get(k));
+          endTs = System.nanoTime();
+          Measurements.getMeasurements().measure("write_cdc_log",
+              (int) ((endTs - startTs) / 1000));
+          long latency = System.currentTimeMillis() - updateTimestamp.get(i).get(k);
+          Measurements.getMeasurements().measure("cdc_generate", (int) (latency * 1000));
+          cdcIsLate = latency > MAX_ALLOW_LATENCY_MILLS;
+        }
       }
+
       bufferKeys.clear();
-      inBufferKeySet.clear();
+      inBufferKeySets.clear();
       bufferUpdateAfter.clear();
       updateTimestamp.clear();
+      currentBatch = 1;
+    }
+
+    int getBufferKeySize() {
+      int size = 0;
+      for (List<byte[]> bufferKey : bufferKeys) {
+        size += bufferKey.size();
+      }
+      return size;
+    }
+
+    private class FetchTask implements Callable<List<byte[]>> {
+
+      private final ReadOptions readOptions;
+      private final byte[] timestamp;
+      private final List<byte[]> bufferKey;
+
+      public FetchTask(ReadOptions readOptions,
+                       List<byte[]> bufferKey,
+                       byte[] timestamp) {
+        this.readOptions = readOptions;
+        this.bufferKey = bufferKey;
+        this.timestamp = timestamp;
+      }
+
+      @Override
+      public List<byte[]> call() throws Exception {
+        readOptions.setTimestamp(new Slice(timestamp));
+        return rocksDB.multiGetAsList(readOptions, bufferKey);
+      }
     }
 
     private void writeUpdateToCDCLog(byte[] key,

@@ -67,13 +67,15 @@ public class RocksDBAyncClientTest {
     }
 
     Status result;
-    for (int i = 0; i < 100 ;i++) {
-      result = instance.update(MOCK_TABLE, MOCK_KEY2 + i, newValues);
+    long start = System.nanoTime();
+    for (int i = 0; i < 5; i++) {
+      for (int j = 0; j < 100; j++) {
+        result = instance.update(MOCK_TABLE, MOCK_KEY2 + i, newValues);
+      }
     }
 
-    for (int i = 0; i < 100 ;i++) {
-      result = instance.update(MOCK_TABLE, MOCK_KEY2 + i, newValues);
-    }
+    long end = System.nanoTime();
+    System.out.println(end - start);
 
 //     result = instance.update(MOCK_TABLE, MOCK_KEY2, newValues);
     final Map<String, ByteIterator> resultParam = new HashMap<>(NUM_RECORDS);

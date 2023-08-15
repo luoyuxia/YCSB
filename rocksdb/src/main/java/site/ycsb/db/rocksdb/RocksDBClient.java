@@ -50,6 +50,7 @@ public class RocksDBClient extends DB {
   private static final String COLUMN_FAMILY_NAMES_FILENAME = "CF_NAMES";
   private static final String CDC_LOG_FILE_NAME = "/tmp/cdc_log";
   private static final String STATISTIC_FILE_NAME = "/tmp/statistic";
+  private static final int BATCH_SIZE = 512;
 
   private static final Logger LOGGER = LoggerFactory.getLogger(RocksDBClient.class);
 
@@ -57,6 +58,7 @@ public class RocksDBClient extends DB {
   @GuardedBy("RocksDBClient.class") private static Path optionsFile = null;
   @GuardedBy("RocksDBClient.class") private static RocksObject dbOptions = null;
   @GuardedBy("RocksDBClient.class") private static WriteOptions writeOptions = null;
+  @GuardedBy("RocksDBClient.class") private static ReadOptions readOptions = null;
   @GuardedBy("RocksDBClient.class") private static RocksDB rocksDb = null;
   @GuardedBy("RocksDBClient.class") private static int references = 0;
   @GuardedBy("RocksDBClient.class") private static FileOutputStream outputStream;
@@ -65,6 +67,10 @@ public class RocksDBClient extends DB {
 
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
+  private final List<byte[]> bufferKeys = new ArrayList<>();
+  private final List<byte[]> bufferUpdateAfter = new ArrayList<>();
+  private final Set<ByteBuffer> inBufferKeySet = new HashSet<>();
+  private final List<Long> bufferUpdateTimeStamps = new ArrayList<>();
 
   @Override
   public void init() throws DBException {
@@ -97,6 +103,7 @@ public class RocksDBClient extends DB {
         }
 
         writeOptions = new WriteOptions().setDisableWAL(true);
+        readOptions = new ReadOptions();
 
         // set object mapper
         objectMapper = new ObjectMapper();
@@ -211,6 +218,7 @@ public class RocksDBClient extends DB {
 
   @Override
   public void cleanup() throws DBException {
+    mayFlush(true);
     super.cleanup();
 
     synchronized (RocksDBClient.class) {
@@ -229,6 +237,9 @@ public class RocksDBClient extends DB {
 
           writeOptions.close();
           writeOptions = null;
+
+          readOptions.close();
+          readOptions = null;
 
           outputStream.close();
           outputStream = null;
@@ -323,43 +334,73 @@ public class RocksDBClient extends DB {
         createColumnFamily(table);
       }
 
-      ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      // note: current we use default cf for only in default cf, we can get the
-      // file read latency
-      cf = rocksDb.getDefaultColumnFamily();
-      final Map<String, ByteIterator> result = new HashMap<>();
-
-      // read update_before
-      long startTs = System.nanoTime();
       final byte[] keyBytes = key.getBytes(UTF_8);
-      final byte[] currentValues = rocksDb.get(cf, keyBytes);
-      long endTs = System.nanoTime();
-      Measurements.getMeasurements().measure("read_while_updating",
-          (int) ((endTs - startTs) / 1000));
 
-      if(currentValues == null) {
-        return Status.NOT_FOUND;
+      ByteBuffer keyByteBuffer = ByteBuffer.wrap(keyBytes);
+      // we have to flush if we seen the key again, otherwise we will get wrong result
+      boolean forceFlush = inBufferKeySet.contains(keyByteBuffer);
+      if (forceFlush) {
+        Measurements.getMeasurements().measure("forceFlush", bufferKeys.size());
+        mayFlush(true);
       }
-      deserializeValues(currentValues, null, result);
 
-      // update
-      result.putAll(values);
-      byte[] updateAfterValues = serializeValues(result);
-
-      startTs = System.nanoTime();
-      // now write update_before and update_after
-      writeUpdateToCDCLog(keyBytes, currentValues, updateAfterValues);
-      endTs = System.nanoTime();
-      Measurements.getMeasurements().measure("write_update_to_cdc",
-          (int) ((endTs - startTs) / 1000));
-
-      rocksDb.put(cf, key.getBytes(UTF_8), updateAfterValues);
-
+      inBufferKeySet.add(keyByteBuffer);
+      bufferKeys.add(keyBytes);
+      byte[] updateAfterValues = serializeValues(values);
+      bufferUpdateAfter.add(updateAfterValues);
+      bufferUpdateTimeStamps.add(System.nanoTime());
+      mayFlush(false);
       return Status.OK;
-
     } catch(final RocksDBException | IOException e) {
       LOGGER.error(e.getMessage(), e);
       return Status.ERROR;
+    }
+  }
+
+  private void mayFlush(boolean force) {
+    // if force, but no thing to flush, return directly
+    if (force && bufferKeys.isEmpty()) {
+      return;
+    }
+    // if not force, and the size is less than batch size, return directly
+    if (!force && (bufferKeys.size() < BATCH_SIZE)) {
+      return;
+    }
+
+    try {
+      long startTs = System.nanoTime();
+      List<byte[]> updateBefore = rocksDb.multiGetAsList(readOptions, bufferKeys);
+      long endTs = System.nanoTime();
+      Measurements.getMeasurements().measure("batch_get_as_list",
+          (int) ((endTs - startTs) / (1000 * bufferKeys.size())));
+
+      for (int i = 0; i < updateBefore.size(); i++) {
+        startTs = System.nanoTime();
+        writeUpdateToCDCLog(bufferKeys.get(i),
+            updateBefore.get(i),
+            bufferUpdateAfter.get(i));
+        endTs = System.nanoTime();
+        Measurements.getMeasurements().measure("write_cdc_log",
+            (int) ((endTs - startTs) / 1000));
+
+        startTs = System.nanoTime();
+        // note: current we use default cf for only in default cf, we can get the
+        // file read latency
+        ColumnFamilyHandle cf = rocksDb.getDefaultColumnFamily();
+        rocksDb.put(cf, bufferKeys.get(i),  bufferUpdateAfter.get(i));
+        endTs = System.nanoTime();
+        Measurements.getMeasurements().measure("write_update_to_cdc",
+            (int) ((endTs - startTs) / 1000));
+
+        Measurements.getMeasurements().measure("update_latency",
+            (int) ((System.nanoTime() - bufferUpdateTimeStamps.get(i)) / 1000));
+      }
+      bufferKeys.clear();
+      inBufferKeySet.clear();
+      bufferUpdateAfter.clear();
+      bufferUpdateTimeStamps.clear();
+    } catch (Exception e) {
+      throw new RuntimeException("Fail to multi get keys", e);
     }
   }
 

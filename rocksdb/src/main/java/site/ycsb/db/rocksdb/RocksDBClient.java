@@ -336,7 +336,6 @@ public class RocksDBClient extends DB {
       // we have to flush if we seen the key again, otherwise we will get wrong result
       boolean forceFlush = inBufferKeySet.contains(keyByteBuffer);
       if (forceFlush) {
-        Measurements.getMeasurements().measure("forceFlush", bufferKeys.size());
         mayFlush(true);
       }
 
@@ -367,6 +366,7 @@ public class RocksDBClient extends DB {
       long startTs = System.nanoTime();
       List<byte[]> updateBefore = rocksDb.multiGetAsList(readOptions, bufferKeys);
       long endTs = System.nanoTime();
+      Measurements.getMeasurements().measure("batch_get_key_size", bufferKeys.size());
       Measurements.getMeasurements().measure("batch_get_as_list",
           (int) ((endTs - startTs) / (1000 * bufferKeys.size())));
 

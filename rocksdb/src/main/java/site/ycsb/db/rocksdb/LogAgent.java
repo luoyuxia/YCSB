@@ -66,7 +66,8 @@ public class LogAgent {
     private final ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
     private  boolean logAgentIsFinish;
 
-    private final List<byte[]> bufferKeys = new ArrayList<>();
+    private final List<ByteBuffer> bufferKeys = new ArrayList<>();
+    private final List<ByteBuffer> bufferValues = new ArrayList<>();
     private final List<byte[]> bufferUpdateAfter = new ArrayList<>();
     private final Set<ByteBuffer> inBufferKeySet = new HashSet<>();
     private final List<Long> updateTimestamp= new ArrayList<>();
@@ -124,7 +125,11 @@ public class LogAgent {
 
         // add the key to buffer keys
         inBufferKeySet.add(keyByteBuffer);
-        bufferKeys.add(key);
+        ByteBuffer byteBufferKey = ByteBuffer.allocateDirect(key.length).put(key);
+        byteBufferKey.flip();
+        bufferKeys.add(byteBufferKey);
+        bufferValues.add(ByteBuffer.allocateDirect(1));
+
         // add update after
         bufferUpdateAfter.add(updateAfter);
         updateTimestamp.add(timestampLong / 1_000_000);
@@ -146,29 +151,38 @@ public class LogAgent {
       }
       long startTs = System.nanoTime();
       readOptions.setTimestamp(new Slice(toTimestamp(searchTimeStamp)));
-      List<byte[]> updateBefore = rocksDB.multiGetAsList(readOptions, bufferKeys);
+
+      rocksDB.multiGetByteBuffers(readOptions, bufferKeys, bufferValues);
+
       long endTs = System.nanoTime();
       Measurements.getMeasurements().measure("batch_get_as_list",
           (int) ((endTs - startTs) / (1000 * bufferKeys.size())));
       Measurements.getMeasurements().measure("batch_get_size",
           bufferKeys.size());
 
-      for (int i = 0; i < updateBefore.size(); i++) {
+      for (int i = 0; i < bufferValues.size(); i++) {
         startTs = System.nanoTime();
-        writeUpdateToCDCLog(bufferKeys.get(i),
-            updateBefore.get(i), bufferUpdateAfter.get(i));
+        writeUpdateToCDCLog(bufferBytes(bufferKeys.get(i)),
+            bufferBytes(bufferValues.get(i)), bufferUpdateAfter.get(i));
         endTs = System.nanoTime();
         Measurements.getMeasurements().measure("write_cdc_log",
             (int) ((endTs - startTs) / 1000));
 
         long latency = System.currentTimeMillis() - updateTimestamp.get(i);
-        Measurements.getMeasurements().measure("cdc_generate", (int) (latency * 1000));
-//        cdcIsLate = latency > MAX_ALLOW_LATENCY_MILLS;
+        Measurements.getMeasurements().measure("cdc_generate", (int) latency);
+        cdcIsLate = latency > MAX_ALLOW_LATENCY_MILLS;
       }
       bufferKeys.clear();
+      bufferValues.clear();
       inBufferKeySet.clear();
       bufferUpdateAfter.clear();
       updateTimestamp.clear();
+    }
+
+    private byte[] bufferBytes(final ByteBuffer byteBuffer) {
+      final byte[] result = new byte[byteBuffer.limit()];
+      byteBuffer.get(result);
+      return result;
     }
 
     private void writeUpdateToCDCLog(byte[] key,
